@@ -1,6 +1,8 @@
 #include "DumpWalker.hpp"
+#include <map>
 
 namespace unstd {
+	std::map<HANDLE, DumpWalker *> DumpWalkerMap;
 	static DWORD SymbolProcess = 0;
 	DumpWalker::DumpWalker(const std::wstring &dumpfile, 
 		const std::wstring &symbolSearchPath) 
@@ -11,9 +13,13 @@ namespace unstd {
 		_dumpFileMappingHandle(NULL), 
 		_dumpMemoryPtr(NULL), 
 		_symProcess(NULL) {
+			_symProcess = (HANDLE) ++SymbolProcess;
+			DumpWalkerMap[_symProcess] = this;
 	}
 
 	DumpWalker::~DumpWalker() {
+		DumpWalkerMap[_symProcess] = NULL;
+
 		if (!_openned) {
 			return;
 		}
@@ -72,7 +78,6 @@ namespace unstd {
 			| SYMOPT_UNDNAME;
 		SymSetOptions(opt);
 
-		_symProcess = (HANDLE)++SymbolProcess;
 		if (SymInitializeW(_symProcess, _symbolSearchPath.c_str(), FALSE) == FALSE) {
 			throw DumpWalkingFailedException(ERROR_INITIALIZE_SYMBOL, GetLastError());
 		}
@@ -147,11 +152,182 @@ namespace unstd {
 		return modules;
 	}
 
-	void DumpWalker::analyze() {
+	void DumpWalker::readMemoryInfo() {
+		MINIDUMP_DIRECTORY *md = NULL;
+		ULONG size = 0;
+		MINIDUMP_MEMORY_LIST *memoryList = NULL;
+		if (MiniDumpReadDumpStream(_dumpMemoryPtr, MemoryListStream, &md, (PVOID *)&memoryList, &size) == FALSE 
+			|| size < sizeof(MINIDUMP_MEMORY_LIST)) {
+				throw DumpWalkingFailedException(ERROR_READ_MEMORY_LIST);
+		}
+
+		_memorys.clear();
+		_memorys.reserve(memoryList->NumberOfMemoryRanges);
+		for (ULONG32 i = 0; i < memoryList->NumberOfMemoryRanges; ++i) {
+			MINIDUMP_MEMORY_DESCRIPTOR m = memoryList->MemoryRanges[i];
+			MemoryInfo mi;
+			mi.baseAddress = m.StartOfMemoryRange;
+			mi.size = m.Memory.DataSize;
+			mi.basePtr = static_cast<PBYTE>(ptrAtRVA(m.Memory.Rva));
+			_memorys.push_back(mi);
+		}
+	}
+
+	DumpExceptionInfo DumpWalker::readExcpetionInfo() {
+		MINIDUMP_DIRECTORY *md = NULL;
+		ULONG size = 0;
+		MINIDUMP_EXCEPTION_STREAM *except = NULL;
+		if (MiniDumpReadDumpStream(_dumpMemoryPtr, ExceptionStream, &md, (PVOID *)&except, &size) == FALSE 
+			|| size < sizeof(MINIDUMP_EXCEPTION_STREAM)) {
+				throw DumpWalkingFailedException(ERROR_READ_EXCEPTION_INFO);
+		}
+
+		DumpExceptionInfo de;
+		de.threadId = except->ThreadId;
+		de.code = except->ExceptionRecord.ExceptionCode;
+		CONTEXT *ctx = static_cast<CONTEXT *>(ptrAtRVA(except->ThreadContext.Rva));
+		memcpy(&de.context, ctx, except->ThreadContext.DataSize);
+		return de;
+	}
+
+	std::vector<DumpStackFrame> DumpWalker::readStackFrame(const DumpExceptionInfo &except, 
+		USHORT processorArchitecture) {
+		DWORD machineType = 0; 
+		STACKFRAME64 sf64;
+		memset(&sf64, 0, sizeof(STACKFRAME64));
+		sf64.AddrPC.Mode = AddrModeFlat;  
+		sf64.AddrFrame.Mode = AddrModeFlat;  
+		sf64.AddrStack.Mode = AddrModeFlat;  
+		sf64.AddrBStore.Mode = AddrModeFlat; 
+		switch(processorArchitecture)
+		{
+#ifdef _X86_
+		case PROCESSOR_ARCHITECTURE_INTEL: 
+			machineType = IMAGE_FILE_MACHINE_I386;
+			sf64.AddrPC.Offset = except.context.Eip;    
+			sf64.AddrStack.Offset = except.context.Esp;
+			sf64.AddrFrame.Offset = except.context.Ebp;
+			break;
+#endif
+#ifdef _AMD64_
+		case PROCESSOR_ARCHITECTURE_AMD64:
+			machineType = IMAGE_FILE_MACHINE_AMD64;
+			sf64.AddrPC.Offset = except.context.Rip;    
+			sf64.AddrStack.Offset = except.context.Rsp;
+			sf64.AddrFrame.Offset = except.context.Rbp;
+			break;
+#endif
+#ifdef _IA64_
+		case PROCESSOR_ARCHITECTURE_AMD64:
+			machineType = IMAGE_FILE_MACHINE_IA64;
+			sf64.AddrPC.Offset = except.context.StIIP;
+			sf64.AddrStack.Offset = except.context.IntSp;
+			sf64.AddrFrame.Offset = except.context.RsBSP;    
+			sf64.AddrBStore.Offset = except.context.RsBSP;
+			break;
+#endif 
+		default:
+			throw DumpWalkingFailedException(ERROR_UNSUPPORT_PLATFORM);
+		}
+
+		std::vector<DumpStackFrame> stackFrames;
+		do 
+		{
+			BOOL walk = StackWalk64(machineType, _symProcess, (HANDLE)except.threadId, 
+				&sf64, (PVOID)(&except.context), 
+				DumpWalker::ReadMemoryRoutine, 
+				DumpWalker::FunctionTableAccessRoutine, 
+				DumpWalker::GetModuleBaseRoutine, 
+				NULL);
+
+			if (walk == FALSE) {
+				break;
+			}
+
+			DumpStackFrame frame;
+			IMAGEHLP_LINEW64 line64;
+			line64.SizeOfStruct = sizeof(IMAGEHLP_LINEW64);
+			DWORD disp = 0;
+			if (SymGetLineFromAddrW64(_symProcess, sf64.AddrPC.Offset, &disp, &line64)) {
+				frame.filename = line64.FileName;
+				frame.line = line64.LineNumber;
+			}
+
+			byte buf[4096] = {0};
+			DWORD64 displacement = 0;
+			SYMBOL_INFOW *si = (SYMBOL_INFOW *)buf;
+			si->SizeOfStruct = sizeof(SYMBOL_INFOW);
+			si->MaxNameLen = (sizeof(buf) / sizeof(*buf) - sizeof(SYMBOL_INFO) - 1) / sizeof(*(si->Name));
+			if (SymFromAddrW(_symProcess, sf64.AddrPC.Offset, &displacement, si)) {
+				frame.symbolName = si->Name;
+				frame.offset = displacement;
+			}
+
+			if (frame.filename.empty()) {
+				continue;;
+			}
+
+			stackFrames.push_back(frame);
+		} while (true);
+
+		if (stackFrames.empty()) {
+			throw DumpWalkingFailedException(ERRPR_STACK_FRAME_EMPTY);
+		}
+
+		return stackFrames;
+	}
+
+	BOOL DumpWalker::ReadMemoryRoutine(HANDLE hProcess, DWORD64 lpBaseAddress, 
+		PVOID lpBuffer, DWORD nSize, LPDWORD lpNumberOfBytesRead) {
+			if (lpBuffer == NULL || nSize == 0 || lpNumberOfBytesRead == NULL) {
+				return FALSE;
+			}
+
+			auto fnd = DumpWalkerMap.find(hProcess);
+			if (fnd == DumpWalkerMap.end()) {
+				return FALSE;
+			}
+
+			DumpWalker *walker = fnd->second;
+			return walker->readMemory(lpBaseAddress, lpBuffer, nSize, lpNumberOfBytesRead);
+	}
+
+	BOOL DumpWalker::readMemory(DWORD64 baseAddr, PVOID buffer, DWORD size, LPDWORD readSize) {
+		for (auto iter = _memorys.begin(); iter != _memorys.end(); ++iter) {
+			if (baseAddr < iter->baseAddress || baseAddr >= iter->baseAddress + iter->size) {
+				continue;
+			}
+
+			DWORD offset = (DWORD)(baseAddr - iter->baseAddress);
+			DWORD sz = size;
+			if (offset + sz > iter->size) {
+				sz = iter->size - offset;
+			}
+
+			if (sz == 0) {
+				return FALSE;
+			}
+
+			memcpy(buffer, iter->basePtr + offset, sz);
+			*readSize = sz;
+			return TRUE;
+		}
+
+		return FALSE;
+	}
+
+	DumpInfo DumpWalker::analyze() {
 		openDumpFile();
 		initializeSymbol();
 
-		auto sys = readSystemInfo();
-		auto modules = readModuleInfo();
+		DumpInfo dump;
+		dump.dumpFilepath = _dumpFilePath;
+		dump.sys = readSystemInfo();
+		dump.modules = readModuleInfo();
+		readMemoryInfo();
+		dump.except = readExcpetionInfo();
+		dump.stackFrames = readStackFrame(dump.except, dump.sys.processorArchitecture);
+
+		return dump;
 	}
 }
